@@ -339,6 +339,9 @@ def scam_word(item):
 def matches(search, item):
     if not title_ok(search["query"], item["title"]):
         return False
+    t = item["title"].lower()
+    if any(w in t for w in search.get("exclude") or []):
+        return False
     p = item["price"]
     if search.get("max_price") is not None and p is not None and p > search["max_price"]:
         return False
@@ -438,7 +441,8 @@ HELP = (
     "<code>iphone 16 tot 500</code>\n"
     "<code>iphone 16 vanaf 200 tot 500</code>\n"
     "<code>fiets binnen 15 km</code> (2dehands + Marktplaats)\n"
-    "<code>ps5 op 2dehands en vinted</code>\n\n"
+    "<code>ps5 op 2dehands en vinted</code>\n"
+    "<code>iphone 15 -hoesje -zoek</code> (woorden uitsluiten)\n\n"
     "<code>lijst</code> — je zoekopdrachten\n"
     "<code>stop 2</code> — zoekopdracht 2 verwijderen\n\n"
     "Je krijgt alleen nieuwe zoekertjes. Verdachte zoekertjes (WhatsApp, vooruitbetalen, "
@@ -448,9 +452,12 @@ HELP = (
 
 
 def parse_zoek(arg):
-    """Geeft (zoekterm, minprijs, maxprijs, sites, km, postcode, iets_opgegeven) terug."""
+    """Geeft (zoekterm, minprijs, maxprijs, sites, km, postcode, iets_opgegeven, uitsluiten) terug."""
     sites, min_p, max_p, km, pc = list(SITES), None, None, None, None
     explicit_sites = given = False
+    words = arg.split()  # '-woord' = zoekertjes met dat woord overslaan
+    excl = [w[1:].lower().strip(",") for w in words if w.startswith("-") and len(w) > 1]
+    arg = " ".join(w for w in words if not (w.startswith("-") and len(w) > 1))
     num = r"€?\s*(\d+(?:[.,]\d+)?)\s*(?:euro|eur|€)?"
     for _ in range(4):  # 'tot', 'vanaf', 'op' en 'binnen' in om het even welke volgorde
         m = re.search(r"\s+binnen\s+(\d+(?:[.,]\d+)?)\s*km(?:\s+(?:van|rond)\s+(\w+))?\s*$", arg, re.I)
@@ -472,7 +479,7 @@ def parse_zoek(arg):
             arg, given = arg[:m.start()], True
     if km and not explicit_sites:
         sites = list(KM_SITES)
-    return arg.strip(), min_p, max_p, sites, km, pc, given
+    return arg.strip(), min_p, max_p, sites, km, pc, given, excl
 
 
 def parse_price(text):
@@ -501,13 +508,15 @@ def describe(s):
         extra += f" vanaf {euro(s['min_price'])}"
     if s.get("km"):
         extra += f" binnen {s['km']:g} km"
+    if s.get("exclude"):
+        extra += " zonder " + ", ".join(html.escape(w) for w in s["exclude"])
     sites = " + ".join(SITE_NAMES[x] for x in s["sites"])
     return f"{s['id']}. {html.escape(s['query'])}{extra} ({sites})"
 
 
-def add_search(state, query, min_p, max_p, sites, km, pc=None):
+def add_search(state, query, min_p, max_p, sites, km, pc=None, exclude=None):
     s = {"id": state["next_id"], "query": query, "min_price": min_p, "max_price": max_p,
-         "sites": sites, "km": km, "postcode": pc, "primed": False}
+         "sites": sites, "km": km, "postcode": pc, "exclude": exclude or [], "primed": False}
     state["next_id"] += 1
     state["searches"].append(s)
     return s
@@ -549,13 +558,13 @@ def run_command(state, text):
 
     if cmd != "zoek":
         arg = text  # gewone tekst = nieuwe zoekopdracht
-    query, min_p, max_p, sites, km, pc, given = parse_zoek(arg)
+    query, min_p, max_p, sites, km, pc, given, excl = parse_zoek(arg)
     if not query:
         return "Wat moet ik zoeken? Bv. iphone 16"
     if given:  # snelle schrijfwijze: meteen toevoegen
-        s = add_search(state, query, min_p, max_p, sites, km, pc)
+        s = add_search(state, query, min_p, max_p, sites, km, pc, excl)
         return f"✅ Toegevoegd:\n{describe(s)}\nIk meld vanaf nu nieuwe zoekertjes."
-    start_draft(state, query)
+    start_draft(state, query, excl)
     return None
 
 
@@ -592,9 +601,9 @@ def show_price(d):
             f"<code>tot 300</code> of <code>vanaf 100</code>."), rows
 
 
-def start_draft(state, query):
+def start_draft(state, query, excl=None):
     d = {"query": query, "sites": list(SITES), "km": None, "min": None, "max": None,
-         "step": "sites"}
+         "exclude": excl or [], "step": "sites"}
     text, rows = show_sites(d)
     d["msg"] = send(text, rows)
     state["draft"] = d
@@ -603,7 +612,8 @@ def start_draft(state, query):
 def finish_draft(state):
     d = state["draft"]
     state["draft"] = None
-    s = add_search(state, d["query"], d["min"], d["max"], d["sites"], d["km"])
+    s = add_search(state, d["query"], d["min"], d["max"], d["sites"], d["km"],
+                   exclude=d.get("exclude"))
     text = f"✅ Toegevoegd:\n{describe(s)}\nIk zoek nu en meld daarna alleen nieuwe zoekertjes."
     if d.get("msg"):
         edit(d["msg"], text, [])
