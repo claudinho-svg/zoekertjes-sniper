@@ -323,6 +323,8 @@ def euro(p):
 
 def price_text(item):
     if item["price"] is not None:
+        if item["price_type"] == "MIN_BID":
+            return f"Bieden vanaf {euro(item['price'])}"
         return euro(item["price"])
     pt = item["price_type"]
     return PRICE_TYPES.get(pt, pt if pt and not pt.isupper() else "Prijs onbekend")
@@ -354,7 +356,7 @@ def matches(search, item):
     p = item["price"]
     if search.get("max_price") is not None and p is not None and p > search["max_price"]:
         return False
-    if search.get("min_price") is not None and (p is None or p < search["min_price"]):
+    if search.get("min_price") is not None and p is not None and p < search["min_price"]:
         return False
     km = search.get("km")
     if km and item["site"] == "marktplaats":
