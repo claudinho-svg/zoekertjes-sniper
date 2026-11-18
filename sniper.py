@@ -113,46 +113,47 @@ PRICE_TYPES = {
 }
 
 
-_vinted = None
+VINTED_RE = re.compile(
+    r'\\"productItem\\":\{\\"id\\":(\d+),\\"title\\":\\"(.*?)\\",\\"url\\":\\"(/items/[^"\\\\]+)\\"'
+    r'.*?\\"price\\":\{\\"amount\\":\\"([\d.]+)\\"', re.S)
 
 
-def vinted_opener():
-    """Vinted wil eerst een sessiecookie van de homepage."""
-    global _vinted
-    if _vinted is None:
-        op = urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
-        op.addheaders = [("User-Agent", UA), ("Accept-Language", "nl-BE,nl;q=0.9")]
-        op.open(SITES["vinted"] + "/", timeout=25).read()
-        _vinted = op
-    return _vinted
+def _unescape(t):
+    for _ in range(2):  # tekst zit dubbel ge-escaped in de pagina
+        if "\\" not in t:
+            break
+        try:
+            t = json.loads('"' + t + '"')
+        except ValueError:
+            break
+    return t
 
 
 def search_vinted(query):
-    params = {"search_text": query, "order": "newest_first", "per_page": 30, "page": 1}
-    url = SITES["vinted"] + "/api/v2/catalog/items?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
-    with vinted_opener().open(req, timeout=25) as r:
-        data = json.load(r)
-    items = []
-    for it in data.get("items", []):
-        if not it.get("id"):
+    """Vinted heeft geen open zoek-API meer: de resultaten staan in de pagina zelf."""
+    params = {"search_text": query, "order": "newest_first"}
+    url = SITES["vinted"] + "/catalog?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={
+        "User-Agent": UA, "Accept": "text/html", "Accept-Language": "nl-BE,nl;q=0.9"})
+    with urllib.request.urlopen(req, timeout=40) as r:
+        page = r.read().decode("utf-8", "replace")
+    items, ids = [], set()
+    for m in VINTED_RE.finditer(page):
+        item_id, title, path, amount = m.groups()
+        if item_id in ids:
             continue
-        price = it.get("price")
-        amount = price.get("amount") if isinstance(price, dict) else price
-        try:
-            amount = float(amount)
-        except (TypeError, ValueError):
-            amount = None
+        ids.add(item_id)
         items.append({
-            "id": f"v{it['id']}",
+            "id": f"v{item_id}",
             "site": "vinted",
-            "title": (it.get("title") or "").strip(),
-            "price": amount,
+            "title": _unescape(title).strip(),
+            "price": float(amount),
             "price_type": "",
             "city": "",
-            "url": it.get("url") or f"{SITES['vinted']}/items/{it['id']}",
+            "url": SITES["vinted"] + path,
         })
+        if len(items) >= 40:
+            break
     return items
 
 
@@ -252,7 +253,18 @@ def price_text(item):
     return PRICE_TYPES.get(pt, pt if pt and not pt.isupper() else "Prijs onbekend")
 
 
+def title_ok(query, title):
+    """Elk woord van de zoekopdracht moet in de titel staan ('15' past niet op '150' of '18')."""
+    t = (title or "").lower()
+    for word in query.lower().split():
+        if not re.search(r"(?<![0-9])" + re.escape(word) + (r"(?![0-9])" if word[-1].isdigit() else ""), t):
+            return False
+    return True
+
+
 def matches(search, item):
+    if not title_ok(search["query"], item["title"]):
+        return False
     mx = search.get("max_price")
     if mx is not None and item["price"] is not None and item["price"] > mx:
         return False
@@ -260,6 +272,15 @@ def matches(search, item):
     if km and item["site"] == "marktplaats":
         return item.get("dist") is not None and item["dist"] <= km
     return True
+
+
+def format_item(i, s):
+    dist = f"{i['dist']:.0f} km" if i.get("dist") is not None else ""
+    info = " · ".join(x for x in (price_text(i), html.escape(i["city"]), dist, i["site"]) if x)
+    return (f"🎯 <b>{html.escape(i['title'])}</b>\n"
+            f"{info}\n"
+            f"Zoekopdracht: {html.escape(s['query'])}\n"
+            f"{html.escape(i['url'])}")
 
 
 def check_searches(state):
@@ -291,22 +312,21 @@ def check_searches(state):
                 new.append(i)
 
         if not s.get("primed"):
-            # eerste keer: bestaande zoekertjes alleen onthouden, niet melden
+            # eerste keer: bestaande zoekertjes onthouden en de 3 nieuwste tonen
             if found:
                 s["primed"] = True
+                preview = [i for i in found if matches(s, i)][:3]
+                if preview:
+                    send(f"👀 Zo ziet het eruit voor <b>{html.escape(s['query'])}</b> "
+                         f"(nieuwste nu online, hierna krijg je alleen nieuwe):")
+                for i in preview:
+                    send(format_item(i, s))
             continue
 
         for i in new:
             if not matches(s, i) or sent >= MAX_ALERTS_PER_RUN:
                 continue
-            dist = f"{i['dist']:.0f} km" if i.get("dist") is not None else ""
-            info = " · ".join(x for x in (price_text(i), html.escape(i["city"]), dist, i["site"]) if x)
-            send(
-                f"🎯 <b>{html.escape(i['title'])}</b>\n"
-                f"{info}\n"
-                f"Zoekopdracht: {html.escape(s['query'])}\n"
-                f"{html.escape(i['url'])}"
-            )
+            send(format_item(i, s))
             sent += 1
 
         state["seen"][key] = seen[-MAX_SEEN_PER_SEARCH:]
