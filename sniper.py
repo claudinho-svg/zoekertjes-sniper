@@ -3,30 +3,34 @@
 Zoekertjes-sniper: houdt 2dehands.be, Marktplaats.nl, Vinted.be en
 Kleinanzeigen.de in de gaten en stuurt nieuwe zoekertjes naar Telegram.
 
-Bediening via Telegram (gewoon typen, slash mag maar hoeft niet):
-  iphone 15                        -> zoekt op alle vier de sites
-  iphone 15 tot 500                -> alleen zoekertjes tot 500 euro
-  nike dunk tot 80 op vinted
-  ps5 op 2dehands en kleinanzeigen
-  fiets tot 200 binnen 15 km       -> rond je postcode, 2dehands + Marktplaats
+Bediening via Telegram:
+  iphone 16                        -> knoppen: platform, afstand, prijs kiezen
+  iphone 16 tot 500                -> meteen toevoegen (snelle schrijfwijze)
+  iphone 16 vanaf 200 tot 500 binnen 25 km op 2dehands en vinted
   lijst                            -> toont je zoekopdrachten
   stop 2                           -> verwijdert zoekopdracht nr. 2
   help
 
+Extra:
+  - berichten van de bot worden na 24 uur automatisch verwijderd
+  - scamfilter: verdachte woorden eruit, verdacht lage prijzen gemarkeerd
+
 Draaien:
-  python3 sniper.py               -> één keer checken (voor GitHub Actions)
+  python3 sniper.py               -> één keer checken
+  python3 sniper.py --duur 14     -> 14 minuten blijven draaien (GitHub Actions)
   python3 sniper.py --loop 120    -> blijft checken, elke 120 seconden (eigen computer)
 
-Nodig: omgevingsvariabelen TELEGRAM_TOKEN en TELEGRAM_CHAT_ID.
+Nodig: omgevingsvariabelen TELEGRAM_TOKEN en TELEGRAM_CHAT_ID
+(optioneel POSTCODE en LOCATIE="lat,lon" voor afstanden).
 Gebruikt alleen de standaardbibliotheek van Python, niets te installeren.
 """
 import argparse
 import html
-import http.cookiejar
 import json
 import math
 import os
 import re
+import statistics
 import sys
 import time
 import urllib.error
@@ -42,6 +46,9 @@ SITES = {
     "vinted": "https://www.vinted.be",
     "kleinanzeigen": "https://www.kleinanzeigen.de",
 }
+SITE_NAMES = {"2dehands": "2dehands", "marktplaats": "Marktplaats",
+              "vinted": "Vinted", "kleinanzeigen": "Kleinanzeigen"}
+KM_SITES = ("2dehands", "marktplaats")   # sites waar afstand werkt
 SITE_RE = "2dehands|marktplaats|vinted|kleinanzeigen"
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -50,21 +57,35 @@ UA = (
 MAX_SEEN_PER_SEARCH = 600
 MAX_ALERTS_PER_RUN = 15          # voorkomt een spervuur aan berichten
 ERROR_NOTIFY_EVERY = 6 * 3600    # foutmelding hoogstens om de 6 uur
+DELETE_AFTER = 24 * 3600         # berichten van de bot verwijderen na 24 uur
+
+# Scamfilter: zoekertjes met deze woorden in titel of beschrijving worden overgeslagen
+SCAM_WORDS = [
+    "whatsapp", "whats app", "wa.me", "telegram", "signal app",
+    "vooruitbetal", "vooraf betal", "voorschot", "western union", "moneygram",
+    "vrienden en familie", "friends and family", "friends & family",
+    "replica", "1:1", "fake", "nagemaakt", "namaak",
+    "icloud lock", "icloud locked", "icloud vergrendeld", "activation lock",
+    "geblokkeerd", "blacklist", "gestolen",
+]
+LOW_PRICE_RATIO = 0.4            # < 40% van de gewone prijs = verdacht
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-POSTCODE = os.environ.get("POSTCODE", "").strip()   # geheim, voor "binnen 20 km"
+POSTCODE = os.environ.get("POSTCODE", "").strip()   # geheim, voor afstanden
 try:  # geheim, "lat,lon" van thuis: afstand voor Marktplaats (kent geen BE-postcodes)
     HOME = tuple(float(x) for x in os.environ.get("LOCATIE", "").split(","))[:2] or None
 except ValueError:
     HOME = None
+
+SENT_LOG = []   # (message_id, tijd) van berichten die de bot stuurde
 
 
 # ---------------------------------------------------------------- status
 
 def load_state():
     state = {"searches": [], "seen": {}, "update_offset": 0, "next_id": 1,
-             "last_error_notice": 0}
+             "last_error_notice": 0, "sent": [], "draft": None}
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, encoding="utf-8") as f:
             state.update(json.load(f))
@@ -72,13 +93,15 @@ def load_state():
 
 
 def save_state(state):
+    state["sent"].extend(SENT_LOG)
+    SENT_LOG.clear()
     tmp = STATE_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=1)
     os.replace(tmp, STATE_FILE)
 
 
-# ---------------------------------------------------------------- http
+# ---------------------------------------------------------------- http / telegram
 
 def http_json(url, data=None, timeout=25):
     req = urllib.request.Request(url, data=data, headers={
@@ -91,16 +114,56 @@ def http_json(url, data=None, timeout=25):
 
 
 def tg(method, **params):
+    for k, v in list(params.items()):
+        if isinstance(v, (dict, list)):
+            params[k] = json.dumps(v)
     data = urllib.parse.urlencode(params).encode()
     wait = int(params.get("timeout", 0))
     return http_json(f"https://api.telegram.org/bot{TOKEN}/{method}", data, timeout=wait + 25)
 
 
-def send(text):
+def send(text, buttons=None, preview=True):
+    """Stuurt een bericht; geeft het message_id terug."""
+    params = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
+    if buttons:
+        params["reply_markup"] = {"inline_keyboard": buttons}
+    if not preview:
+        params["link_preview_options"] = {"is_disabled": True}
     try:
-        tg("sendMessage", chat_id=CHAT_ID, text=text, parse_mode="HTML")
+        res = tg("sendMessage", **params)
+        mid = res["result"]["message_id"]
+        SENT_LOG.append([mid, time.time()])
+        return mid
     except urllib.error.HTTPError as e:
         print(f"Telegram-fout: {e} {e.read()[:300]!r}", file=sys.stderr)
+    except Exception as e:
+        print(f"Telegram-fout: {e}", file=sys.stderr)
+    return None
+
+
+def edit(message_id, text, buttons=None):
+    params = {"chat_id": CHAT_ID, "message_id": message_id, "text": text,
+              "parse_mode": "HTML", "link_preview_options": {"is_disabled": True}}
+    if buttons is not None:
+        params["reply_markup"] = {"inline_keyboard": buttons}
+    try:
+        tg("editMessageText", **params)
+    except Exception as e:  # bv. "message is not modified"
+        print(f"Bewerken mislukt: {e}", file=sys.stderr)
+
+
+def cleanup_messages(state):
+    """Verwijdert berichten die ouder zijn dan DELETE_AFTER (Telegram kan tot 48 uur)."""
+    now, keep = time.time(), []
+    for mid, ts in state.get("sent", []):
+        if now - ts < DELETE_AFTER:
+            keep.append([mid, ts])
+        elif now - ts < 47 * 3600:
+            try:
+                tg("deleteMessage", chat_id=CHAT_ID, message_id=mid)
+            except Exception:
+                pass  # al weg of te oud: niets aan te doen
+    state["sent"] = keep
 
 
 # ---------------------------------------------------------------- zoeken
@@ -111,7 +174,6 @@ PRICE_TYPES = {
     "RESERVED": "Gereserveerd", "EXCHANGE": "Ruilen", "ON_REQUEST": "Op aanvraag",
     "VB": "Bieden (VB)", "Zu verschenken": "Gratis",
 }
-
 
 VINTED_RE = re.compile(
     r'\\"productItem\\":\{\\"id\\":(\d+),\\"title\\":\\"(.*?)\\",\\"url\\":\\"(/items/[^"\\\\]+)\\"'
@@ -144,13 +206,10 @@ def search_vinted(query):
             continue
         ids.add(item_id)
         items.append({
-            "id": f"v{item_id}",
-            "site": "vinted",
-            "title": _unescape(title).strip(),
-            "price": float(amount),
-            "price_type": "",
-            "city": "",
-            "url": SITES["vinted"] + path,
+            "id": f"v{item_id}", "site": "vinted",
+            "title": _unescape(title).strip(), "desc": "",
+            "price": float(amount), "price_type": "",
+            "city": "", "url": SITES["vinted"] + path, "dist": None,
         })
         if len(items) >= 40:
             break
@@ -169,16 +228,18 @@ def parse_kleinanzeigen(page):
         title = re.search(r'<a[^>]*class="[^"]*ellipsis[^"]*"[^>]*>(.*?)</a>', body, re.S)
         price_m = re.search(r'price-shipping--price[^>]*>(.*?)</p>', body, re.S)
         loc = re.search(r'aditem-main--top--left[^>]*>(.*?)</div>', body, re.S)
+        desc = re.search(r'aditem-main--middle--description[^>]*>(.*?)</p>', body, re.S)
         price_txt = _clean(price_m.group(1)) if price_m else ""
         num = re.search(r"(\d[\d.]*)\s*€", price_txt)
         items.append({
-            "id": f"k{ad_id}",
-            "site": "kleinanzeigen",
+            "id": f"k{ad_id}", "site": "kleinanzeigen",
             "title": _clean(title.group(1)) if title else "",
+            "desc": _clean(desc.group(1)) if desc else "",
             "price": float(num.group(1).replace(".", "")) if num else None,
             "price_type": "" if num else (price_txt or "SEE_DESCRIPTION"),
             "city": _clean(loc.group(1)) if loc else "",
             "url": SITES["kleinanzeigen"] + (href.group(1) if href else f"/s-anzeige/{ad_id}"),
+            "dist": None,
         })
     return items
 
@@ -226,9 +287,9 @@ def search_site(site, query, km=None, postcode=None):
         elif km and site == "marktplaats" and HOME and loc.get("latitude"):
             dist = haversine(HOME, (loc["latitude"], loc["longitude"]))
         items.append({
-            "id": item_id,
-            "site": site,
-            "title": l.get("title", "").strip(),
+            "id": item_id, "site": site,
+            "title": (l.get("title") or "").strip(),
+            "desc": l.get("description") or "",
             "price": cents / 100 if cents else None,
             "price_type": pi.get("priceType", ""),
             "city": loc.get("cityName", ""),
@@ -245,10 +306,15 @@ def haversine(a, b):
     return 6371 * 2 * math.asin(math.sqrt(h))
 
 
+# ---------------------------------------------------------------- filteren
+
+def euro(p):
+    return f"€ {p:,.0f}".replace(",", ".") if p == int(p) else f"€ {p:.2f}"
+
+
 def price_text(item):
     if item["price"] is not None:
-        p = item["price"]
-        return f"€ {p:,.0f}".replace(",", ".") if p == int(p) else f"€ {p:.2f}"
+        return euro(item["price"])
     pt = item["price_type"]
     return PRICE_TYPES.get(pt, pt if pt and not pt.isupper() else "Prijs onbekend")
 
@@ -262,11 +328,21 @@ def title_ok(query, title):
     return True
 
 
+def scam_word(item):
+    text = f"{item['title']} {item.get('desc', '')}".lower()
+    for w in SCAM_WORDS:
+        if w in text:
+            return w
+    return None
+
+
 def matches(search, item):
     if not title_ok(search["query"], item["title"]):
         return False
-    mx = search.get("max_price")
-    if mx is not None and item["price"] is not None and item["price"] > mx:
+    p = item["price"]
+    if search.get("max_price") is not None and p is not None and p > search["max_price"]:
+        return False
+    if search.get("min_price") is not None and (p is None or p < search["min_price"]):
         return False
     km = search.get("km")
     if km and item["site"] == "marktplaats":
@@ -274,11 +350,20 @@ def matches(search, item):
     return True
 
 
-def format_item(i, s):
+def typical_price(items):
+    prices = [i["price"] for i in items if i["price"]]
+    return statistics.median(prices) if len(prices) >= 5 else None
+
+
+def format_item(i, s, normal=None):
     dist = f"{i['dist']:.0f} km" if i.get("dist") is not None else ""
-    info = " · ".join(x for x in (price_text(i), html.escape(i["city"]), dist, i["site"]) if x)
+    info = " · ".join(x for x in (price_text(i), html.escape(i["city"]), dist,
+                                  SITE_NAMES.get(i["site"], i["site"])) if x)
+    warn = ""
+    if normal and i["price"] and i["price"] < normal * LOW_PRICE_RATIO:
+        warn = f"\n⚠️ Opgelet: veel goedkoper dan normaal (± {euro(normal)}), mogelijk scam"
     return (f"🎯 <b>{html.escape(i['title'])}</b>\n"
-            f"{info}\n"
+            f"{info}{warn}\n"
             f"Zoekopdracht: {html.escape(s['query'])}\n"
             f"{html.escape(i['url'])}")
 
@@ -293,8 +378,8 @@ def check_searches(state):
         found = []
         km = s.get("km")
         pc = s.get("postcode") or POSTCODE
-        if km and not pc:
-            errors.append(f"'{s['query']}': geen postcode ingesteld voor 'binnen {km:g} km'")
+        if km and "2dehands" in s["sites"] and not pc:
+            errors.append(f"'{s['query']}': geen POSTCODE ingesteld voor de afstand")
         if km and "marktplaats" in s["sites"] and not HOME:
             errors.append(f"'{s['query']}': geen LOCATIE ingesteld voor Marktplaats-afstand")
         for site in s["sites"]:
@@ -311,73 +396,121 @@ def check_searches(state):
                 seen.append(i["id"])
                 new.append(i)
 
+        good = [i for i in found if title_ok(s["query"], i["title"]) and not scam_word(i)]
+        normal = typical_price(good)
+
         if not s.get("primed"):
             # eerste keer: bestaande zoekertjes onthouden en de 3 nieuwste tonen
             if found:
                 s["primed"] = True
-                preview = [i for i in found if matches(s, i)][:3]
+                preview = [i for i in good if matches(s, i)][:3]
                 if preview:
                     send(f"👀 Zo ziet het eruit voor <b>{html.escape(s['query'])}</b> "
                          f"(nieuwste nu online, hierna krijg je alleen nieuwe):")
+                else:
+                    send(f"👀 Nu staat er niets online voor <b>{html.escape(s['query'])}</b> "
+                         f"met jouw filters. Ik laat het weten zodra er iets bijkomt.")
                 for i in preview:
-                    send(format_item(i, s))
+                    send(format_item(i, s, normal))
             continue
 
         for i in new:
             if not matches(s, i) or sent >= MAX_ALERTS_PER_RUN:
                 continue
-            send(format_item(i, s))
+            w = scam_word(i)
+            if w:
+                print(f"Scamfilter: '{i['title']}' overgeslagen ({w})")
+                continue
+            send(format_item(i, s, normal))
             sent += 1
 
         state["seen"][key] = seen[-MAX_SEEN_PER_SEARCH:]
     return sent, errors
 
 
-# ---------------------------------------------------------------- commando's
+# ---------------------------------------------------------------- tekst-commando's
 
 HELP = (
     "<b>Zoekertjes-sniper</b>\n"
-    "Stuur gewoon wat je zoekt, bv.:\n"
-    "iphone 15 — zoekt op 2dehands, Marktplaats, Vinted en Kleinanzeigen\n"
-    "iphone 15 tot 500 — met maximumprijs\n"
-    "nike dunk tot 80 op vinted — maar één site\n"
-    "ps5 op 2dehands en vinted — twee sites\n"
-    "fiets tot 200 binnen 15 km — rond je postcode (2dehands + Marktplaats)\n\n"
-    "lijst — je zoekopdrachten\n"
-    "stop 2 — zoekopdracht 2 verwijderen\n\n"
-    "Je krijgt alleen nieuwe zoekertjes; wat er al stond meld ik niet."
+    "Stuur gewoon wat je zoekt, bv. <code>iphone 16</code>: ik vraag dan met knoppen "
+    "welk platform, hoe ver en welke prijs.\n\n"
+    "Sneller kan ook in één bericht:\n"
+    "<code>iphone 16 tot 500</code>\n"
+    "<code>iphone 16 vanaf 200 tot 500</code>\n"
+    "<code>fiets binnen 15 km</code> (2dehands + Marktplaats)\n"
+    "<code>ps5 op 2dehands en vinted</code>\n\n"
+    "<code>lijst</code> — je zoekopdrachten\n"
+    "<code>stop 2</code> — zoekopdracht 2 verwijderen\n\n"
+    "Je krijgt alleen nieuwe zoekertjes. Verdachte zoekertjes (WhatsApp, vooruitbetalen, "
+    "replica, iCloud-lock...) filter ik eruit, en een verdacht lage prijs krijgt een ⚠️. "
+    "Mijn berichten verdwijnen na 24 uur."
 )
 
 
 def parse_zoek(arg):
-    """Geeft (zoekterm, maxprijs, sites, km, postcode) terug."""
-    sites, max_price, km, pc, explicit = list(SITES), None, None, None, False
-    for _ in range(3):  # 'tot', 'op' en 'binnen' in om het even welke volgorde
+    """Geeft (zoekterm, minprijs, maxprijs, sites, km, postcode, iets_opgegeven) terug."""
+    sites, min_p, max_p, km, pc = list(SITES), None, None, None, None
+    explicit_sites = given = False
+    num = r"€?\s*(\d+(?:[.,]\d+)?)\s*(?:euro|eur|€)?"
+    for _ in range(4):  # 'tot', 'vanaf', 'op' en 'binnen' in om het even welke volgorde
         m = re.search(r"\s+binnen\s+(\d+(?:[.,]\d+)?)\s*km(?:\s+(?:van|rond)\s+(\w+))?\s*$", arg, re.I)
         if m:
             km = float(m.group(1).replace(",", "."))
             pc = m.group(2)
-            arg = arg[:m.start()]
+            arg, given = arg[:m.start()], True
         m = re.search(rf"\s+op\s+((?:{SITE_RE})(?:\s*(?:,|\+|en)\s*(?:{SITE_RE}))*)\s*$", arg, re.I)
         if m:
             sites = list(dict.fromkeys(re.findall(SITE_RE, m.group(1).lower())))
-            explicit = True
-            arg = arg[:m.start()]
-        m = re.search(r"\s+tot\s+€?\s*(\d+(?:[.,]\d+)?)\s*(?:euro|eur|€)?\s*$", arg, re.I)
+            arg, given, explicit_sites = arg[:m.start()], True, True
+        m = re.search(rf"\s+(?:tot|max)\s+{num}\s*$", arg, re.I)
         if m:
-            max_price = float(m.group(1).replace(",", "."))
-            arg = arg[:m.start()]
-    if km and not explicit:
-        sites = ["2dehands", "marktplaats"]  # sites waar afstand werkt
-    return arg.strip(), max_price, sites, km, pc
+            max_p = float(m.group(1).replace(",", "."))
+            arg, given = arg[:m.start()], True
+        m = re.search(rf"\s+(?:vanaf|min)\s+{num}\s*$", arg, re.I)
+        if m:
+            min_p = float(m.group(1).replace(",", "."))
+            arg, given = arg[:m.start()], True
+    if km and not explicit_sites:
+        sites = list(KM_SITES)
+    return arg.strip(), min_p, max_p, sites, km, pc, given
+
+
+def parse_price(text):
+    """'100-300', 'tot 300', 'vanaf 100', '300' -> (min, max) of None."""
+    t = text.lower().replace("€", "").replace("euro", "").strip()
+    m = re.fullmatch(r"(\d+)\s*(?:-|tot|à|a)\s*(\d+)", t)
+    if m:
+        a, b = sorted((float(m.group(1)), float(m.group(2))))
+        return a, b
+    m = re.fullmatch(r"(?:tot|max|maximum)\s*(\d+)", t) or re.fullmatch(r"(\d+)", t)
+    if m:
+        return None, float(m.group(1))
+    m = re.fullmatch(r"(?:vanaf|min|minimum)\s*(\d+)", t)
+    if m:
+        return float(m.group(1)), None
+    return None
 
 
 def describe(s):
-    extra = f" tot € {s['max_price']:g}" if s.get("max_price") is not None else ""
+    extra = ""
+    if s.get("min_price") is not None and s.get("max_price") is not None:
+        extra += f" {euro(s['min_price'])}–{euro(s['max_price'])}"
+    elif s.get("max_price") is not None:
+        extra += f" tot {euro(s['max_price'])}"
+    elif s.get("min_price") is not None:
+        extra += f" vanaf {euro(s['min_price'])}"
     if s.get("km"):
         extra += f" binnen {s['km']:g} km"
-    sites = " + ".join(s["sites"])
+    sites = " + ".join(SITE_NAMES[x] for x in s["sites"])
     return f"{s['id']}. {html.escape(s['query'])}{extra} ({sites})"
+
+
+def add_search(state, query, min_p, max_p, sites, km, pc=None):
+    s = {"id": state["next_id"], "query": query, "min_price": min_p, "max_price": max_p,
+         "sites": sites, "km": km, "postcode": pc, "primed": False}
+    state["next_id"] += 1
+    state["searches"].append(s)
+    return s
 
 
 def run_command(state, text):
@@ -386,29 +519,25 @@ def run_command(state, text):
     parts = text.split(maxsplit=1)
     cmd = parts[0].split("@")[0].lower().lstrip("/")
     arg = parts[1].strip() if len(parts) > 1 else ""
-    if cmd not in ("start", "help", "zoek", "lijst", "stop"):
-        cmd, arg = "zoek", text  # gewone tekst = nieuwe zoekopdracht
-    cmd = "/" + cmd
 
-    if cmd in ("/start", "/help"):
+    draft = state.get("draft")
+    if draft and draft.get("step") == "price" and cmd not in ("lijst", "stop", "help", "start"):
+        pr = parse_price(text)
+        if pr:
+            draft["min"], draft["max"] = pr
+            return finish_draft(state)
+        if text.lower() in ("geen", "geen limiet", "nee"):
+            return finish_draft(state)
+
+    if cmd in ("start", "help"):
         return HELP
 
-    if cmd == "/zoek":
-        query, max_price, sites, km, pc = parse_zoek(arg)
-        if not query:
-            return "Wat moet ik zoeken? Bv. iphone 15 tot 500"
-        s = {"id": state["next_id"], "query": query, "max_price": max_price,
-             "sites": sites, "km": km, "postcode": pc, "primed": False}
-        state["next_id"] += 1
-        state["searches"].append(s)
-        return f"✅ Toegevoegd:\n{describe(s)}\nIk meld vanaf nu nieuwe zoekertjes."
-
-    if cmd == "/lijst":
+    if cmd == "lijst":
         if not state["searches"]:
-            return "Nog geen zoekopdrachten. Stuur bv. iphone 15 tot 500"
+            return "Nog geen zoekopdrachten. Stuur bv. iphone 16"
         return "<b>Je zoekopdrachten</b>\n" + "\n".join(describe(s) for s in state["searches"])
 
-    if cmd == "/stop":
+    if cmd == "stop":
         if not arg.isdigit():
             return "Welke? Bv. stop 2 (nummers zie je met lijst)"
         n = int(arg)
@@ -418,63 +547,178 @@ def run_command(state, text):
         return f"🗑️ Zoekopdracht {n} verwijderd." if len(state["searches"]) < before \
             else f"Zoekopdracht {n} bestaat niet. Zie lijst."
 
-    return HELP
+    if cmd != "zoek":
+        arg = text  # gewone tekst = nieuwe zoekopdracht
+    query, min_p, max_p, sites, km, pc, given = parse_zoek(arg)
+    if not query:
+        return "Wat moet ik zoeken? Bv. iphone 16"
+    if given:  # snelle schrijfwijze: meteen toevoegen
+        s = add_search(state, query, min_p, max_p, sites, km, pc)
+        return f"✅ Toegevoegd:\n{describe(s)}\nIk meld vanaf nu nieuwe zoekertjes."
+    start_draft(state, query)
+    return None
 
 
-def handle_commands(state, wait=0):
-    """Leest nieuwe berichten; wacht tot `wait` seconden op een bericht (long polling)."""
-    res = tg("getUpdates", offset=state["update_offset"], timeout=wait)
-    if res.get("result"):
-        print(f"{len(res['result'])} Telegram-bericht(en) ontvangen")
+# ---------------------------------------------------------------- knoppen (wizard)
+
+def btn(text, data):
+    return {"text": text, "callback_data": data}
+
+
+def draft_title(d):
+    return f"🔎 <b>{html.escape(d['query'])}</b>"
+
+
+def show_sites(d):
+    rows = [[btn(("✅ " if s in d["sites"] else "⬜ ") + SITE_NAMES[s], f"p:{s}")] for s in SITES]
+    rows.append([btn("Verder ➡️", "next"), btn("✖️ Annuleer", "cancel")])
+    return f"{draft_title(d)}\nStap 1/3 — Op welke platformen zoeken?", rows
+
+
+def show_km(d):
+    rows = [[btn("5 km", "km:5"), btn("10 km", "km:10"), btn("15 km", "km:15")],
+            [btn("25 km", "km:25"), btn("50 km", "km:50"), btn("100 km", "km:100")],
+            [btn("🌍 Maakt niet uit", "km:0")]]
+    return (f"{draft_title(d)}\nStap 2/3 — Hoe ver mag het zijn? "
+            f"(geldt voor 2dehands en Marktplaats)"), rows
+
+
+def show_price(d):
+    rows = [[btn("tot €50", "pr:0-50"), btn("tot €100", "pr:0-100"), btn("tot €250", "pr:0-250")],
+            [btn("tot €500", "pr:0-500"), btn("tot €1000", "pr:0-1000")],
+            [btn("💶 Geen limiet", "pr:none")]]
+    return (f"{draft_title(d)}\nStap 3/3 — Welke prijs?\n"
+            f"Tik een knop, of typ zelf bv. <code>100-300</code>, "
+            f"<code>tot 300</code> of <code>vanaf 100</code>."), rows
+
+
+def start_draft(state, query):
+    d = {"query": query, "sites": list(SITES), "km": None, "min": None, "max": None,
+         "step": "sites"}
+    text, rows = show_sites(d)
+    d["msg"] = send(text, rows)
+    state["draft"] = d
+
+
+def finish_draft(state):
+    d = state["draft"]
+    state["draft"] = None
+    s = add_search(state, d["query"], d["min"], d["max"], d["sites"], d["km"])
+    text = f"✅ Toegevoegd:\n{describe(s)}\nIk zoek nu en meld daarna alleen nieuwe zoekertjes."
+    if d.get("msg"):
+        edit(d["msg"], text, [])
+        return None
+    return text
+
+
+def handle_button(state, cq):
+    data = cq.get("data", "")
+    try:
+        tg("answerCallbackQuery", callback_query_id=cq["id"])
+    except Exception:
+        pass
+    d = state.get("draft")
+    msg_id = (cq.get("message") or {}).get("message_id")
+    if not d or msg_id != d.get("msg"):
+        edit(msg_id, "⌛ Deze keuze is verlopen. Stuur je zoekopdracht opnieuw.", [])
+        return
+    if data == "cancel":
+        state["draft"] = None
+        edit(msg_id, f"{draft_title(d)}\n✖️ Geannuleerd.", [])
+        return
+    if data.startswith("p:"):
+        site = data[2:]
+        if site in d["sites"]:
+            if len(d["sites"]) > 1:
+                d["sites"].remove(site)
+        else:
+            d["sites"].append(site)
+            d["sites"].sort(key=list(SITES).index)
+        edit(msg_id, *show_sites(d))
+        return
+    if data == "next":
+        if any(s in KM_SITES for s in d["sites"]):
+            d["step"] = "km"
+            edit(msg_id, *show_km(d))
+        else:
+            d["step"] = "price"
+            edit(msg_id, *show_price(d))
+        return
+    if data.startswith("km:"):
+        d["km"] = float(data[3:]) or None
+        d["step"] = "price"
+        edit(msg_id, *show_price(d))
+        return
+    if data.startswith("pr:"):
+        if data != "pr:none":
+            lo, hi = data[3:].split("-")
+            d["min"], d["max"] = (float(lo) or None), float(hi)
+        finish_draft(state)
+        return
+
+
+def handle_updates(state, wait=0):
+    """Leest nieuwe berichten en knopdrukken; wacht tot 'wait' seconden (long polling)."""
+    res = tg("getUpdates", offset=state["update_offset"], timeout=wait,
+             allowed_updates=["message", "callback_query"])
     for u in res.get("result", []):
         state["update_offset"] = u["update_id"] + 1
+        if "callback_query" in u:
+            cq = u["callback_query"]
+            if str((cq.get("message") or {}).get("chat", {}).get("id")) == CHAT_ID:
+                handle_button(state, cq)
+            continue
         msg = u.get("message") or {}
         if str((msg.get("chat") or {}).get("id")) != CHAT_ID:
             print("Bericht van een andere chat genegeerd")
             continue  # alleen jij mag de bot bedienen
         reply = run_command(state, (msg.get("text") or "").strip())
         if reply:
-            send(reply)
+            send(reply, preview=False)
     return bool(res.get("result"))
 
 
 # ---------------------------------------------------------------- hoofdlus
 
-def run_once():
-    state = load_state()
-    try:
-        handle_commands(state)
-    except Exception as e:
-        print(f"Kon Telegram-berichten niet ophalen: {e}", file=sys.stderr)
-    save_state(state)  # commando's niet kwijtraken als het zoeken misloopt
-
-    sent, errors = check_searches(state)
+def report(state, errors):
     if errors and time.time() - state.get("last_error_notice", 0) > ERROR_NOTIFY_EVERY:
         send("⚠️ Zoeken lukte niet helemaal:\n" + html.escape("\n".join(errors[:5])))
         state["last_error_notice"] = time.time()
+
+
+def run_once():
+    state = load_state()
+    try:
+        handle_updates(state)
+    except Exception as e:
+        print(f"Kon Telegram-berichten niet ophalen: {e}", file=sys.stderr)
+    save_state(state)  # commando's niet kwijtraken als het zoeken misloopt
+    sent, errors = check_searches(state)
+    report(state, errors)
+    cleanup_messages(state)
     save_state(state)
     print(f"{len(state['searches'])} zoekopdracht(en), {sent} melding(en), {len(errors)} fout(en)")
 
 
 def run_for(minutes, check_every=120):
-    """Blijft `minutes` minuten draaien: antwoordt meteen op berichten
-    en checkt de sites om de `check_every` seconden."""
+    """Blijft 'minutes' minuten draaien: antwoordt meteen op berichten
+    en checkt de sites om de 'check_every' seconden."""
     end = time.time() + minutes * 60
     state = load_state()
     last_check = 0
     while time.time() < end:
         try:
-            changed = handle_commands(state, wait=min(30, max(1, int(end - time.time()))))
+            changed = handle_updates(state, wait=min(30, max(1, int(end - time.time()))))
         except Exception as e:
             print(f"Kon Telegram-berichten niet ophalen: {e}", file=sys.stderr)
             changed = False
             time.sleep(10)
-        if changed or time.time() - last_check >= check_every:
+        new_search = any(not s.get("primed") for s in state["searches"])
+        if (changed and new_search) or time.time() - last_check >= check_every:
             sent, errors = check_searches(state)
             last_check = time.time()
-            if errors and time.time() - state.get("last_error_notice", 0) > ERROR_NOTIFY_EVERY:
-                send("⚠️ Zoeken lukte niet helemaal:\n" + html.escape("\n".join(errors[:5])))
-                state["last_error_notice"] = time.time()
+            report(state, errors)
+            cleanup_messages(state)
             print(f"{len(state['searches'])} zoekopdracht(en), {sent} melding(en), {len(errors)} fout(en)")
         save_state(state)
 
