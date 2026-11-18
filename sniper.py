@@ -402,10 +402,12 @@ def run_command(state, text):
 
 def handle_commands(state):
     res = tg("getUpdates", offset=state["update_offset"], timeout=0)
+    print(f"{len(res.get('result', []))} Telegram-bericht(en) ontvangen")
     for u in res.get("result", []):
         state["update_offset"] = u["update_id"] + 1
         msg = u.get("message") or {}
         if str((msg.get("chat") or {}).get("id")) != CHAT_ID:
+            print("Bericht van een andere chat genegeerd")
             continue  # alleen jij mag de bot bedienen
         reply = run_command(state, (msg.get("text") or "").strip())
         if reply:
