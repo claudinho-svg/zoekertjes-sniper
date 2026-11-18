@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: write            # nodig om state.json op te slaan
+  actions: write             # nodig om zelf de volgende ronde te starten
 
 concurrency:
   group: sniper
@@ -35,3 +36,9 @@ jobs:
           git config user.email "sniper-bot@users.noreply.github.com"
           git add state.json
           git diff --cached --quiet || (git commit -m "status bijwerken" && git pull --rebase && git push)
+
+      - name: Volgende ronde starten
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run sniper.yml --ref main
