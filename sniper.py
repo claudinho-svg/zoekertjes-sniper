@@ -131,11 +131,13 @@ def tg(method, **params):
     return http_json(f"https://api.telegram.org/bot{TOKEN}/{method}", data, timeout=wait + 25)
 
 
-def send(text, buttons=None, preview=True):
+def send(text, buttons=None, preview=True, keyboard=False):
     """Stuurt een bericht; geeft het message_id terug."""
     params = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
     if buttons:
         params["reply_markup"] = {"inline_keyboard": buttons}
+    elif keyboard:
+        params["reply_markup"] = KEYBOARD
     if not preview:
         params["link_preview_options"] = {"is_disabled": True}
     try:
@@ -394,6 +396,8 @@ def check_searches(state):
     alerted = state.setdefault("alerted", [])   # nooit 2x hetzelfde zoekertje sturen
     alerted_set = set(alerted)
     for s in state["searches"]:
+        if s.get("paused") or state.get("paused_all"):
+            continue
         key = str(s["uid"])
         seen = state["seen"].setdefault(key, [])
         seen_set = set(seen)
@@ -457,21 +461,88 @@ def check_searches(state):
 # ---------------------------------------------------------------- tekst-commando's
 
 HELP = (
-    "<b>Zoekertjes-sniper</b>\n"
-    "Stuur gewoon wat je zoekt, bv. <code>iphone 16</code>: ik vraag dan met knoppen "
-    "welk platform, hoe ver en welke prijs.\n\n"
-    "Sneller kan ook in één bericht:\n"
-    "<code>iphone 16 tot 500</code>\n"
-    "<code>iphone 16 vanaf 200 tot 500</code>\n"
-    "<code>fiets binnen 15 km</code> (2dehands + Marktplaats)\n"
-    "<code>ps5 op 2dehands en vinted</code>\n"
-    "<code>iphone 15 -hoesje -zoek</code> (woorden uitsluiten)\n\n"
-    "<code>lijst</code> — je zoekopdrachten\n"
-    "<code>stop 2</code> — zoekopdracht 2 verwijderen\n\n"
-    "Je krijgt alleen nieuwe zoekertjes. Verdachte zoekertjes (WhatsApp, vooruitbetalen, "
-    "replica, iCloud-lock...) filter ik eruit, en een verdacht lage prijs krijgt een ⚠️. "
-    "Mijn berichten verdwijnen na 24 uur."
+    "<b>🔎 Zoekertjes-sniper</b>\n\n"
+    "<b>Nieuwe zoekopdracht:</b> stuur gewoon wat je zoekt, bv. <code>iphone 16</code>. "
+    "Daarna kies je met knoppen het platform, de afstand en de prijs.\n"
+    "Sneller in één bericht: <code>iphone 16 vanaf 200 tot 500 binnen 25 km op 2dehands</code>\n"
+    "Woorden uitsluiten: <code>iphone 15 -hoesje -gezocht</code>\n\n"
+    "<b>Beheren:</b> tik onderaan op <b>📋 Mijn zoekopdrachten</b> om een zoekopdracht te "
+    "bekijken, bewerken, pauzeren of verwijderen. Met <b>⏯️ Pauze</b> zet je alle meldingen "
+    "even stil.\n\n"
+    "Je krijgt alleen zoekertjes die er net bijkomen. Verdachte zoekertjes filter ik eruit, "
+    "een verdacht lage prijs krijgt een ⚠️. Mijn berichten verdwijnen na 24 uur."
 )
+
+BTN_NEW, BTN_LIST, BTN_PAUSE, BTN_HELP = ("➕ Nieuwe zoekopdracht", "📋 Mijn zoekopdrachten",
+                                          "⏯️ Pauze aan/uit", "❓ Help")
+KEYBOARD = {"keyboard": [[{"text": BTN_NEW}, {"text": BTN_LIST}],
+                         [{"text": BTN_PAUSE}, {"text": BTN_HELP}]],
+            "resize_keyboard": True, "is_persistent": True}
+
+
+def set_commands():
+    try:
+        tg("setMyCommands", commands=[
+            {"command": "menu", "description": "Menu en knoppen tonen"},
+            {"command": "lijst", "description": "Mijn zoekopdrachten beheren"},
+            {"command": "help", "description": "Uitleg"}])
+    except Exception as e:
+        print(f"Commando's instellen mislukt: {e}", file=sys.stderr)
+
+
+def find_search(state, uid):
+    return next((s for s in state["searches"] if str(s["uid"]) == str(uid)), None)
+
+
+def list_view(state):
+    if not state["searches"]:
+        return ("📋 Je hebt nog geen zoekopdrachten.\nStuur bv. <code>iphone 16</code> "
+                "om er een te maken."), []
+    pause = "\n⏸️ <b>Alle meldingen staan op pauze.</b>" if state.get("paused_all") else ""
+    rows = [[btn(f"{'⏸️' if s.get('paused') else '🟢'} {s['id']}. {s['query']}"[:60],
+                 f"m:o:{s['uid']}")] for s in state["searches"]]
+    return f"📋 <b>Je zoekopdrachten</b> — tik er één aan om te beheren.{pause}", rows
+
+
+def one_view(s):
+    status = "⏸️ Gepauzeerd" if s.get("paused") else "🟢 Actief"
+    rows = [[btn("✏️ Bewerken", f"m:e:{s['uid']}"),
+             btn("▶️ Hervatten" if s.get("paused") else "⏸️ Pauzeren", f"m:z:{s['uid']}")],
+            [btn("🗑️ Verwijderen", f"m:x:{s['uid']}"), btn("⬅️ Terug", "m:l")]]
+    return f"{describe(s)}\n\nStatus: {status}", rows
+
+
+def remove_search(state, s):
+    state["searches"].remove(s)
+    state["seen"].pop(str(s["uid"]), None)
+    state.get("maxid", {}).pop(str(s["uid"]), None)
+    renumber(state)
+
+
+def handle_manage(state, data, mid):
+    parts = data.split(":")
+    action, uid = parts[1], (parts[2] if len(parts) > 2 else None)
+    s = find_search(state, uid) if uid else None
+    if action == "l" or not s:
+        edit(mid, *list_view(state))
+    elif action == "o":
+        edit(mid, *one_view(s))
+    elif action == "z":
+        s["paused"] = not s.get("paused")
+        if not s["paused"]:
+            s["primed"] = False  # bij hervatten niet alles van tijdens de pauze sturen
+        edit(mid, *one_view(s))
+    elif action == "x":
+        edit(mid, f"{describe(s)}\n\n🗑️ Zeker verwijderen?",
+             [[btn("✅ Ja, verwijderen", f"m:X:{uid}"), btn("❌ Nee", f"m:o:{uid}")]])
+    elif action == "X":
+        name = s["query"]
+        remove_search(state, s)
+        text, rows = list_view(state)
+        edit(mid, f"🗑️ {html.escape(name)} verwijderd.\n\n" + text, rows)
+    elif action == "e":
+        edit(mid, f"{describe(s)}\n\n✏️ Bewerken hieronder…", [])
+        start_draft(state, s["query"], s.get("exclude"), base=s)
 
 
 def parse_zoek(arg):
@@ -572,13 +643,21 @@ def run_command(state, text):
         if text.lower() in ("geen", "geen limiet", "nee"):
             return finish_draft(state)
 
-    if cmd in ("start", "help"):
-        return HELP
-
-    if cmd == "lijst":
-        if not state["searches"]:
-            return "Nog geen zoekopdrachten. Stuur bv. iphone 16"
-        return "<b>Je zoekopdrachten</b>\n" + "\n".join(describe(s) for s in state["searches"])
+    if text == BTN_HELP or cmd in ("start", "help", "menu"):
+        send(HELP, preview=False, keyboard=True)
+        return None
+    if text == BTN_NEW:
+        return "➕ Stuur wat je zoekt, bv. <code>iphone 16</code> of <code>ps5 tot 300</code>."
+    if text == BTN_PAUSE:
+        state["paused_all"] = not state.get("paused_all")
+        if state["paused_all"]:
+            return "⏸️ Alle meldingen staan op pauze. Tik nog eens op ⏯️ om verder te gaan."
+        for s in state["searches"]:
+            s["primed"] = False  # niet alles van tijdens de pauze in één keer sturen
+        return "▶️ Meldingen staan weer aan."
+    if text == BTN_LIST or cmd == "lijst":
+        send(*list_view(state), preview=False)
+        return None
 
     if cmd == "stop":
         if not arg.isdigit():
@@ -587,10 +666,7 @@ def run_command(state, text):
         gone = [s for s in state["searches"] if s["id"] == n]
         if not gone:
             return f"Zoekopdracht {n} bestaat niet. Zie lijst."
-        state["searches"].remove(gone[0])
-        state["seen"].pop(str(gone[0]["uid"]), None)
-        state.get("maxid", {}).pop(str(gone[0]["uid"]), None)
-        renumber(state)
+        remove_search(state, gone[0])
         rest = "\n".join(describe(s) for s in state["searches"]) or "Geen zoekopdrachten meer."
         return f"🗑️ {html.escape(gone[0]['query'])} verwijderd.\n\n<b>Je zoekopdrachten</b>\n{rest}"
 
@@ -616,7 +692,8 @@ def btn(text, data):
 
 
 def draft_title(d):
-    return f"🔎 <b>{html.escape(d['query'])}</b>"
+    mode = "✏️ Bewerken: " if d.get("edit_uid") else "🔎 "
+    return f"{mode}<b>{html.escape(d['query'])}</b>"
 
 
 def show_sites(d):
@@ -629,6 +706,9 @@ def show_km(d):
     rows = [[btn("5 km", "km:5"), btn("10 km", "km:10"), btn("15 km", "km:15")],
             [btn("25 km", "km:25"), btn("50 km", "km:50"), btn("100 km", "km:100")],
             [btn("🌍 Maakt niet uit", "km:0")]]
+    if d.get("edit_uid"):
+        cur = f"{d['km']:g} km" if d.get("km") else "overal"
+        rows.insert(0, [btn(f"➡️ Laten zoals het is ({cur})", "km:keep")])
     return (f"{draft_title(d)}\nStap 2/3 — Hoe ver mag het zijn? "
             f"(geldt voor 2dehands en Marktplaats)"), rows
 
@@ -637,14 +717,23 @@ def show_price(d):
     rows = [[btn("tot €50", "pr:0-50"), btn("tot €100", "pr:0-100"), btn("tot €250", "pr:0-250")],
             [btn("tot €500", "pr:0-500"), btn("tot €1000", "pr:0-1000")],
             [btn("💶 Geen limiet", "pr:none")]]
+    if d.get("edit_uid"):
+        lo, hi = d.get("min"), d.get("max")
+        cur = (f"{euro(lo)}–{euro(hi)}" if lo and hi else f"tot {euro(hi)}" if hi
+               else f"vanaf {euro(lo)}" if lo else "geen limiet")
+        rows.insert(0, [btn(f"➡️ Laten zoals het is ({cur})", "pr:keep")])
     return (f"{draft_title(d)}\nStap 3/3 — Welke prijs?\n"
             f"Tik een knop, of typ zelf bv. <code>100-300</code>, "
             f"<code>tot 300</code> of <code>vanaf 100</code>."), rows
 
 
-def start_draft(state, query, excl=None):
+def start_draft(state, query, excl=None, base=None):
     d = {"query": query, "sites": list(SITES), "km": None, "min": None, "max": None,
          "exclude": excl or [], "step": "sites"}
+    if base:  # bewerken: start met de huidige instellingen
+        d.update({"sites": list(base["sites"]), "km": base.get("km"),
+                  "min": base.get("min_price"), "max": base.get("max_price"),
+                  "exclude": list(base.get("exclude") or []), "edit_uid": base["uid"]})
     text, rows = show_sites(d)
     d["msg"] = send(text, rows)
     state["draft"] = d
@@ -653,6 +742,12 @@ def start_draft(state, query, excl=None):
 def finish_draft(state):
     d = state["draft"]
     state["draft"] = None
+    target = find_search(state, d["edit_uid"]) if d.get("edit_uid") else None
+    if target:
+        target.update({"sites": d["sites"], "km": d["km"], "min_price": d["min"],
+                       "max_price": d["max"], "primed": False})
+        edit(d["msg"], f"✅ Aangepast:\n{describe(target)}", [[btn("📋 Mijn zoekopdrachten", "m:l")]])
+        return None
     dup = same_search(state, d["query"], d["min"], d["max"], d["sites"], d["km"], d.get("exclude"))
     if dup:
         text = f"ℹ️ Die zoekopdracht staat al in je lijst:\n{describe(dup)}"
@@ -677,6 +772,9 @@ def handle_button(state, cq):
         pass
     d = state.get("draft")
     msg_id = (cq.get("message") or {}).get("message_id")
+    if data.startswith("m:"):
+        handle_manage(state, data, msg_id)
+        return
     if not d or msg_id != d.get("msg"):
         edit(msg_id, "⌛ Deze keuze is verlopen. Stuur je zoekopdracht opnieuw.", [])
         return
@@ -703,14 +801,17 @@ def handle_button(state, cq):
             edit(msg_id, *show_price(d))
         return
     if data.startswith("km:"):
-        d["km"] = float(data[3:]) or None
+        if data != "km:keep":
+            d["km"] = float(data[3:]) or None
         d["step"] = "price"
         edit(msg_id, *show_price(d))
         return
     if data.startswith("pr:"):
-        if data != "pr:none":
+        if data not in ("pr:none", "pr:keep"):
             lo, hi = data[3:].split("-")
             d["min"], d["max"] = (float(lo) or None), float(hi)
+        elif data == "pr:none":
+            d["min"] = d["max"] = None
         finish_draft(state)
         return
 
@@ -770,6 +871,7 @@ def run_for(minutes, check_every=120):
     en checkt de sites om de 'check_every' seconden."""
     end = time.time() + minutes * 60
     state = load_state()
+    set_commands()
     last_check = 0
     while time.time() < end:
         try:
