@@ -89,7 +89,16 @@ def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, encoding="utf-8") as f:
             state.update(json.load(f))
+    for s in state["searches"]:
+        s.setdefault("uid", s["id"])  # vaste interne sleutel; "id" is het nummer dat je ziet
+    renumber(state)
     return state
+
+
+def renumber(state):
+    """Zoekopdrachten altijd 1, 2, 3, ... zonder gaten."""
+    for n, s in enumerate(state["searches"], 1):
+        s["id"] = n
 
 
 def save_state(state):
@@ -381,7 +390,7 @@ def check_searches(state):
     """Geeft (aantal meldingen, lijst fouten) terug."""
     sent, errors = 0, []
     for s in state["searches"]:
-        key = str(s["id"])
+        key = str(s["uid"])
         seen = state["seen"].setdefault(key, [])
         seen_set = set(seen)
         found = []
@@ -520,8 +529,9 @@ def describe(s):
 
 
 def add_search(state, query, min_p, max_p, sites, km, pc=None, exclude=None):
-    s = {"id": state["next_id"], "query": query, "min_price": min_p, "max_price": max_p,
-         "sites": sites, "km": km, "postcode": pc, "exclude": exclude or [], "primed": False}
+    s = {"id": len(state["searches"]) + 1, "uid": state["next_id"], "query": query,
+         "min_price": min_p, "max_price": max_p, "sites": sites, "km": km, "postcode": pc,
+         "exclude": exclude or [], "primed": False}
     state["next_id"] += 1
     state["searches"].append(s)
     return s
@@ -555,11 +565,15 @@ def run_command(state, text):
         if not arg.isdigit():
             return "Welke? Bv. stop 2 (nummers zie je met lijst)"
         n = int(arg)
-        before = len(state["searches"])
-        state["searches"] = [s for s in state["searches"] if s["id"] != n]
-        state["seen"].pop(str(n), None)
-        return f"🗑️ Zoekopdracht {n} verwijderd." if len(state["searches"]) < before \
-            else f"Zoekopdracht {n} bestaat niet. Zie lijst."
+        gone = [s for s in state["searches"] if s["id"] == n]
+        if not gone:
+            return f"Zoekopdracht {n} bestaat niet. Zie lijst."
+        state["searches"].remove(gone[0])
+        state["seen"].pop(str(gone[0]["uid"]), None)
+        state.get("maxid", {}).pop(str(gone[0]["uid"]), None)
+        renumber(state)
+        rest = "\n".join(describe(s) for s in state["searches"]) or "Geen zoekopdrachten meer."
+        return f"🗑️ {html.escape(gone[0]['query'])} verwijderd.\n\n<b>Je zoekopdrachten</b>\n{rest}"
 
     if cmd != "zoek":
         arg = text  # gewone tekst = nieuwe zoekopdracht
