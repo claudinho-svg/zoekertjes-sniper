@@ -80,19 +80,20 @@ def save_state(state):
 
 # ---------------------------------------------------------------- http
 
-def http_json(url, data=None):
+def http_json(url, data=None, timeout=25):
     req = urllib.request.Request(url, data=data, headers={
         "User-Agent": UA,
         "Accept": "application/json",
         "Accept-Language": "nl-BE,nl;q=0.9",
     })
-    with urllib.request.urlopen(req, timeout=25) as r:
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.load(r)
 
 
 def tg(method, **params):
     data = urllib.parse.urlencode(params).encode()
-    return http_json(f"https://api.telegram.org/bot{TOKEN}/{method}", data)
+    wait = int(params.get("timeout", 0))
+    return http_json(f"https://api.telegram.org/bot{TOKEN}/{method}", data, timeout=wait + 25)
 
 
 def send(text):
@@ -400,9 +401,11 @@ def run_command(state, text):
     return HELP
 
 
-def handle_commands(state):
-    res = tg("getUpdates", offset=state["update_offset"], timeout=0)
-    print(f"{len(res.get('result', []))} Telegram-bericht(en) ontvangen")
+def handle_commands(state, wait=0):
+    """Leest nieuwe berichten; wacht tot `wait` seconden op een bericht (long polling)."""
+    res = tg("getUpdates", offset=state["update_offset"], timeout=wait)
+    if res.get("result"):
+        print(f"{len(res['result'])} Telegram-bericht(en) ontvangen")
     for u in res.get("result", []):
         state["update_offset"] = u["update_id"] + 1
         msg = u.get("message") or {}
@@ -412,6 +415,7 @@ def handle_commands(state):
         reply = run_command(state, (msg.get("text") or "").strip())
         if reply:
             send(reply)
+    return bool(res.get("result"))
 
 
 # ---------------------------------------------------------------- hoofdlus
@@ -432,13 +436,41 @@ def run_once():
     print(f"{len(state['searches'])} zoekopdracht(en), {sent} melding(en), {len(errors)} fout(en)")
 
 
+def run_for(minutes, check_every=120):
+    """Blijft `minutes` minuten draaien: antwoordt meteen op berichten
+    en checkt de sites om de `check_every` seconden."""
+    end = time.time() + minutes * 60
+    state = load_state()
+    last_check = 0
+    while time.time() < end:
+        try:
+            changed = handle_commands(state, wait=min(30, max(1, int(end - time.time()))))
+        except Exception as e:
+            print(f"Kon Telegram-berichten niet ophalen: {e}", file=sys.stderr)
+            changed = False
+            time.sleep(10)
+        if changed or time.time() - last_check >= check_every:
+            sent, errors = check_searches(state)
+            last_check = time.time()
+            if errors and time.time() - state.get("last_error_notice", 0) > ERROR_NOTIFY_EVERY:
+                send("⚠️ Zoeken lukte niet helemaal:\n" + html.escape("\n".join(errors[:5])))
+                state["last_error_notice"] = time.time()
+            print(f"{len(state['searches'])} zoekopdracht(en), {sent} melding(en), {len(errors)} fout(en)")
+        save_state(state)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--loop", type=int, metavar="SECONDEN",
                     help="blijf checken met deze pauze (bv. 120)")
+    ap.add_argument("--duur", type=float, metavar="MINUTEN",
+                    help="blijf zoveel minuten draaien en antwoord meteen (voor GitHub)")
     args = ap.parse_args()
     if not TOKEN or not CHAT_ID:
         sys.exit("TELEGRAM_TOKEN en TELEGRAM_CHAT_ID moeten ingesteld zijn.")
+    if args.duur:
+        run_for(args.duur)
+        return
     if not args.loop:
         run_once()
         return
