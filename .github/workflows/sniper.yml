@@ -1,0 +1,34 @@
+# Zet dit bestand in je repo op: .github/workflows/sniper.yml
+name: zoekertjes-sniper
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # elke 5 minuten (GitHub loopt soms wat achter)
+  workflow_dispatch:         # knop "Run workflow" om handmatig te starten
+
+permissions:
+  contents: write            # nodig om state.json op te slaan
+
+concurrency:
+  group: sniper
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Zoekertjes checken
+        run: python3 sniper.py
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      - name: Status opslaan
+        run: |
+          git config user.name "sniper-bot"
+          git config user.email "sniper-bot@users.noreply.github.com"
+          git add state.json
+          git diff --cached --quiet || (git commit -m "status bijwerken" && git push)
