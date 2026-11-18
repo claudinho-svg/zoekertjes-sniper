@@ -353,6 +353,12 @@ def matches(search, item):
     return True
 
 
+def item_number(item):
+    """Volgnummer van een zoekertje (m2467270914 -> 2467270914)."""
+    digits = re.sub(r"\D", "", str(item["id"]))
+    return int(digits) if digits else 0
+
+
 def typical_price(items):
     prices = [i["price"] for i in items if i["price"]]
     return statistics.median(prices) if len(prices) >= 5 else None
@@ -392,29 +398,28 @@ def check_searches(state):
                 errors.append(f"{site} / '{s['query']}': {e}")
                 print(f"Fout bij {site} '{s['query']}': {e}", file=sys.stderr)
 
+        # Alleen echt nieuwe zoekertjes: elk platform nummert oplopend, dus een
+        # zoekertje is pas nieuw als zijn nummer hoger is dan alles wat we al zagen.
+        # Zo komen oude zoekertjes die opnieuw opduiken (topadvertenties) niet door.
+        top = state.setdefault("maxid", {}).setdefault(key, {})
+        before = dict(top)
         new = []
         for i in found:  # zelfde zoekertje op 2 sites = 1 melding
+            n = item_number(i)
+            top[i["site"]] = max(top.get(i["site"], 0), n)
             if i["id"] not in seen_set:
                 seen_set.add(i["id"])
                 seen.append(i["id"])
-                new.append(i)
+                if i["site"] in before and n > before[i["site"]]:
+                    new.append(i)
 
         good = [i for i in found if title_ok(s["query"], i["title"]) and not scam_word(i)]
         normal = typical_price(good)
 
         if not s.get("primed"):
-            # eerste keer: bestaande zoekertjes onthouden en de 3 nieuwste tonen
+            # eerste keer: alles wat er al staat alleen onthouden, niets sturen
             if found:
                 s["primed"] = True
-                preview = [i for i in good if matches(s, i)][:3]
-                if preview:
-                    send(f"👀 Zo ziet het eruit voor <b>{html.escape(s['query'])}</b> "
-                         f"(nieuwste nu online, hierna krijg je alleen nieuwe):")
-                else:
-                    send(f"👀 Nu staat er niets online voor <b>{html.escape(s['query'])}</b> "
-                         f"met jouw filters. Ik laat het weten zodra er iets bijkomt.")
-                for i in preview:
-                    send(format_item(i, s, normal))
             continue
 
         for i in new:
@@ -614,7 +619,7 @@ def finish_draft(state):
     state["draft"] = None
     s = add_search(state, d["query"], d["min"], d["max"], d["sites"], d["km"],
                    exclude=d.get("exclude"))
-    text = f"✅ Toegevoegd:\n{describe(s)}\nIk zoek nu en meld daarna alleen nieuwe zoekertjes."
+    text = f"✅ Toegevoegd:\n{describe(s)}\nJe krijgt vanaf nu alleen zoekertjes die er nieuw bijkomen."
     if d.get("msg"):
         edit(d["msg"], text, [])
         return None
