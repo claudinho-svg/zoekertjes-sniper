@@ -8,6 +8,7 @@ Bediening via Telegram (gewoon typen, slash mag maar hoeft niet):
   iphone 15 tot 500                -> alleen zoekertjes tot 500 euro
   nike dunk tot 80 op vinted
   ps5 op 2dehands en kleinanzeigen
+  fiets tot 200 binnen 15 km       -> rond je postcode (secret POSTCODE), 2dehands
   lijst                            -> toont je zoekopdrachten
   stop 2                           -> verwijdert zoekopdracht nr. 2
   help
@@ -51,6 +52,7 @@ ERROR_NOTIFY_EVERY = 6 * 3600    # foutmelding hoogstens om de 6 uur
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+POSTCODE = os.environ.get("POSTCODE", "").strip()   # geheim, voor "binnen 20 km"
 
 
 # ---------------------------------------------------------------- status
@@ -183,7 +185,7 @@ def search_kleinanzeigen(query):
         return parse_kleinanzeigen(r.read().decode("utf-8", "replace"))
 
 
-def search_site(site, query):
+def search_site(site, query, km=None, postcode=None):
     if site == "vinted":
         return search_vinted(query)
     if site == "kleinanzeigen":
@@ -196,6 +198,9 @@ def search_site(site, query):
         "sortOrder": "DECREASING",
         "viewOptions": "list-view",
     }
+    if km and postcode and site == "2dehands":
+        params["postcode"] = postcode
+        params["distanceMeters"] = int(km * 1000)
     url = SITES[site] + "/lrp/api/search?" + urllib.parse.urlencode(params)
     data = http_json(url)
     items = []
@@ -240,9 +245,13 @@ def check_searches(state):
         seen = state["seen"].setdefault(key, [])
         seen_set = set(seen)
         found = []
+        km = s.get("km")
+        pc = s.get("postcode") or POSTCODE
+        if km and not pc:
+            errors.append(f"'{s['query']}': geen postcode ingesteld voor 'binnen {km:g} km'")
         for site in s["sites"]:
             try:
-                found.extend(search_site(site, s["query"]))
+                found.extend(search_site(site, s["query"], km, pc))
             except Exception as e:  # netwerk, blokkering, gewijzigde site...
                 errors.append(f"{site} / '{s['query']}': {e}")
                 print(f"Fout bij {site} '{s['query']}': {e}", file=sys.stderr)
@@ -282,7 +291,8 @@ HELP = (
     "iphone 15 — zoekt op 2dehands, Marktplaats, Vinted en Kleinanzeigen\n"
     "iphone 15 tot 500 — met maximumprijs\n"
     "nike dunk tot 80 op vinted — maar één site\n"
-    "ps5 op 2dehands en vinted — twee sites\n\n"
+    "ps5 op 2dehands en vinted — twee sites\n"
+    "fiets tot 200 binnen 15 km — rond je postcode (2dehands)\n\n"
     "lijst — je zoekopdrachten\n"
     "stop 2 — zoekopdracht 2 verwijderen\n\n"
     "Je krijgt alleen nieuwe zoekertjes; wat er al stond meld ik niet."
@@ -290,21 +300,32 @@ HELP = (
 
 
 def parse_zoek(arg):
-    sites, max_price = list(SITES), None
-    for _ in range(2):  # 'tot' en 'op' in om het even welke volgorde
+    """Geeft (zoekterm, maxprijs, sites, km, postcode) terug."""
+    sites, max_price, km, pc, explicit = list(SITES), None, None, None, False
+    for _ in range(3):  # 'tot', 'op' en 'binnen' in om het even welke volgorde
+        m = re.search(r"\s+binnen\s+(\d+(?:[.,]\d+)?)\s*km(?:\s+(?:van|rond)\s+(\w+))?\s*$", arg, re.I)
+        if m:
+            km = float(m.group(1).replace(",", "."))
+            pc = m.group(2)
+            arg = arg[:m.start()]
         m = re.search(rf"\s+op\s+((?:{SITE_RE})(?:\s*(?:,|\+|en)\s*(?:{SITE_RE}))*)\s*$", arg, re.I)
         if m:
             sites = list(dict.fromkeys(re.findall(SITE_RE, m.group(1).lower())))
+            explicit = True
             arg = arg[:m.start()]
         m = re.search(r"\s+tot\s+€?\s*(\d+(?:[.,]\d+)?)\s*(?:euro|eur|€)?\s*$", arg, re.I)
         if m:
             max_price = float(m.group(1).replace(",", "."))
             arg = arg[:m.start()]
-    return arg.strip(), max_price, sites
+    if km and not explicit:
+        sites = ["2dehands"]  # afstand werkt op 2dehands (Belgische postcode)
+    return arg.strip(), max_price, sites, km, pc
 
 
 def describe(s):
     extra = f" tot € {s['max_price']:g}" if s.get("max_price") is not None else ""
+    if s.get("km"):
+        extra += f" binnen {s['km']:g} km"
     sites = " + ".join(s["sites"])
     return f"{s['id']}. {html.escape(s['query'])}{extra} ({sites})"
 
@@ -323,11 +344,11 @@ def run_command(state, text):
         return HELP
 
     if cmd == "/zoek":
-        query, max_price, sites = parse_zoek(arg)
+        query, max_price, sites, km, pc = parse_zoek(arg)
         if not query:
             return "Wat moet ik zoeken? Bv. iphone 15 tot 500"
         s = {"id": state["next_id"], "query": query, "max_price": max_price,
-             "sites": sites, "primed": False}
+             "sites": sites, "km": km, "postcode": pc, "primed": False}
         state["next_id"] += 1
         state["searches"].append(s)
         return f"✅ Toegevoegd:\n{describe(s)}\nIk meld vanaf nu nieuwe zoekertjes."
