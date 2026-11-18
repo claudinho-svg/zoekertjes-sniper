@@ -56,7 +56,7 @@ UA = (
 )
 MAX_SEEN_PER_SEARCH = 600
 MAX_ALERTS_PER_RUN = 15          # voorkomt een spervuur aan berichten
-ERROR_NOTIFY_EVERY = 6 * 3600    # foutmelding hoogstens om de 6 uur
+ERROR_NOTIFY_EVERY = 24 * 3600   # foutmelding hoogstens 1 keer per dag
 DELETE_AFTER = 24 * 3600         # berichten van de bot verwijderen na 24 uur
 
 # Scamfilter: zoekertjes met deze woorden in titel of beschrijving worden overgeslagen
@@ -391,6 +391,8 @@ def format_item(i, s, normal=None):
 def check_searches(state):
     """Geeft (aantal meldingen, lijst fouten) terug."""
     sent, errors = 0, []
+    alerted = state.setdefault("alerted", [])   # nooit 2x hetzelfde zoekertje sturen
+    alerted_set = set(alerted)
     for s in state["searches"]:
         key = str(s["uid"])
         seen = state["seen"].setdefault(key, [])
@@ -440,10 +442,15 @@ def check_searches(state):
             if w:
                 print(f"Scamfilter: '{i['title']}' overgeslagen ({w})")
                 continue
+            if i["id"] in alerted_set:
+                continue
+            alerted_set.add(i["id"])
+            alerted.append(i["id"])
             send(format_item(i, s, normal))
             sent += 1
 
         state["seen"][key] = seen[-MAX_SEEN_PER_SEARCH:]
+    state["alerted"] = alerted[-1000:]
     return sent, errors
 
 
@@ -530,6 +537,16 @@ def describe(s):
     return f"{s['id']}. {html.escape(s['query'])}{extra} ({sites})"
 
 
+def same_search(state, query, min_p, max_p, sites, km, exclude=None):
+    """Bestaat precies dezelfde zoekopdracht al? Geeft die terug."""
+    for s in state["searches"]:
+        if (s["query"].lower() == query.lower() and s.get("min_price") == min_p
+                and s.get("max_price") == max_p and sorted(s["sites"]) == sorted(sites)
+                and s.get("km") == km and sorted(s.get("exclude") or []) == sorted(exclude or [])):
+            return s
+    return None
+
+
 def add_search(state, query, min_p, max_p, sites, km, pc=None, exclude=None):
     s = {"id": len(state["searches"]) + 1, "uid": state["next_id"], "query": query,
          "min_price": min_p, "max_price": max_p, "sites": sites, "km": km, "postcode": pc,
@@ -583,6 +600,9 @@ def run_command(state, text):
     if not query:
         return "Wat moet ik zoeken? Bv. iphone 16"
     if given:  # snelle schrijfwijze: meteen toevoegen
+        dup = same_search(state, query, min_p, max_p, sites, km, excl)
+        if dup:
+            return f"ℹ️ Die zoekopdracht staat al in je lijst:\n{describe(dup)}"
         s = add_search(state, query, min_p, max_p, sites, km, pc, excl)
         return f"✅ Toegevoegd:\n{describe(s)}\nIk meld vanaf nu nieuwe zoekertjes."
     start_draft(state, query, excl)
@@ -633,6 +653,13 @@ def start_draft(state, query, excl=None):
 def finish_draft(state):
     d = state["draft"]
     state["draft"] = None
+    dup = same_search(state, d["query"], d["min"], d["max"], d["sites"], d["km"], d.get("exclude"))
+    if dup:
+        text = f"ℹ️ Die zoekopdracht staat al in je lijst:\n{describe(dup)}"
+        if d.get("msg"):
+            edit(d["msg"], text, [])
+            return None
+        return text
     s = add_search(state, d["query"], d["min"], d["max"], d["sites"], d["km"],
                    exclude=d.get("exclude"))
     text = f"✅ Toegevoegd:\n{describe(s)}\nJe krijgt vanaf nu alleen zoekertjes die er nieuw bijkomen."
@@ -713,7 +740,14 @@ def handle_updates(state, wait=0):
 
 def report(state, errors):
     if errors and time.time() - state.get("last_error_notice", 0) > ERROR_NOTIFY_EVERY:
-        send("⚠️ Zoeken lukte niet helemaal:\n" + html.escape("\n".join(errors[:5])))
+        lines = []
+        for e in errors:
+            if e.startswith("kleinanzeigen") and ("403" in e or "429" in e):
+                e = ("Kleinanzeigen blokkeert de servers van GitHub. Zoeken op Kleinanzeigen "
+                     "lukt daardoor nu niet (de andere sites werken gewoon).")
+            if e not in lines:
+                lines.append(e)
+        send("⚠️ Zoeken lukte niet helemaal:\n" + html.escape("\n".join(lines[:5])))
         state["last_error_notice"] = time.time()
 
 
