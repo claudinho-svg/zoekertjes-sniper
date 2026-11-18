@@ -3,7 +3,7 @@ name: zoekertjes-sniper
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # elke 5 minuten (GitHub loopt soms wat achter)
+    - cron: "*/15 * * * *"  # start elk kwartier een ronde van ~14 minuten
   workflow_dispatch:         # knop "Run workflow" om handmatig te starten
 
 permissions:
@@ -16,12 +16,12 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
       - name: Zoekertjes checken
-        run: python3 sniper.py
+        run: python3 sniper.py --duur 14
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
