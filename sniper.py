@@ -8,7 +8,7 @@ Bediening via Telegram (gewoon typen, slash mag maar hoeft niet):
   iphone 15 tot 500                -> alleen zoekertjes tot 500 euro
   nike dunk tot 80 op vinted
   ps5 op 2dehands en kleinanzeigen
-  fiets tot 200 binnen 15 km       -> rond je postcode (secret POSTCODE), 2dehands
+  fiets tot 200 binnen 15 km       -> rond je postcode, 2dehands + Marktplaats
   lijst                            -> toont je zoekopdrachten
   stop 2                           -> verwijdert zoekopdracht nr. 2
   help
@@ -24,6 +24,7 @@ import argparse
 import html
 import http.cookiejar
 import json
+import math
 import os
 import re
 import sys
@@ -53,6 +54,10 @@ ERROR_NOTIFY_EVERY = 6 * 3600    # foutmelding hoogstens om de 6 uur
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 POSTCODE = os.environ.get("POSTCODE", "").strip()   # geheim, voor "binnen 20 km"
+try:  # geheim, "lat,lon" van thuis: afstand voor Marktplaats (kent geen BE-postcodes)
+    HOME = tuple(float(x) for x in os.environ.get("LOCATIE", "").split(","))[:2] or None
+except ValueError:
+    HOME = None
 
 
 # ---------------------------------------------------------------- status
@@ -201,6 +206,8 @@ def search_site(site, query, km=None, postcode=None):
     if km and postcode and site == "2dehands":
         params["postcode"] = postcode
         params["distanceMeters"] = int(km * 1000)
+    elif km and site == "marktplaats":
+        params["limit"] = 100  # landelijk zoeken, zelf filteren op afstand
     url = SITES[site] + "/lrp/api/search?" + urllib.parse.urlencode(params)
     data = http_json(url)
     items = []
@@ -210,16 +217,30 @@ def search_site(site, query, km=None, postcode=None):
             continue
         pi = l.get("priceInfo") or {}
         cents = pi.get("priceCents")
+        loc = l.get("location") or {}
+        dist = None
+        if km and site == "2dehands" and (loc.get("distanceMeters") or -1) >= 0:
+            dist = loc["distanceMeters"] / 1000
+        elif km and site == "marktplaats" and HOME and loc.get("latitude"):
+            dist = haversine(HOME, (loc["latitude"], loc["longitude"]))
         items.append({
             "id": item_id,
             "site": site,
             "title": l.get("title", "").strip(),
             "price": cents / 100 if cents else None,
             "price_type": pi.get("priceType", ""),
-            "city": (l.get("location") or {}).get("cityName", ""),
+            "city": loc.get("cityName", ""),
             "url": SITES[site] + l.get("vipUrl", ""),
+            "dist": dist,
         })
     return items
+
+
+def haversine(a, b):
+    lat1, lon1, lat2, lon2 = map(math.radians, (*a, *b))
+    h = math.sin((lat2 - lat1) / 2) ** 2 + \
+        math.cos(lat1) * math.cos(lat2) * math.sin((lon2 - lon1) / 2) ** 2
+    return 6371 * 2 * math.asin(math.sqrt(h))
 
 
 def price_text(item):
@@ -234,6 +255,9 @@ def matches(search, item):
     mx = search.get("max_price")
     if mx is not None and item["price"] is not None and item["price"] > mx:
         return False
+    km = search.get("km")
+    if km and item["site"] == "marktplaats":
+        return item.get("dist") is not None and item["dist"] <= km
     return True
 
 
@@ -249,6 +273,8 @@ def check_searches(state):
         pc = s.get("postcode") or POSTCODE
         if km and not pc:
             errors.append(f"'{s['query']}': geen postcode ingesteld voor 'binnen {km:g} km'")
+        if km and "marktplaats" in s["sites"] and not HOME:
+            errors.append(f"'{s['query']}': geen LOCATIE ingesteld voor Marktplaats-afstand")
         for site in s["sites"]:
             try:
                 found.extend(search_site(site, s["query"], km, pc))
@@ -256,10 +282,12 @@ def check_searches(state):
                 errors.append(f"{site} / '{s['query']}': {e}")
                 print(f"Fout bij {site} '{s['query']}': {e}", file=sys.stderr)
 
-        new = [i for i in found if i["id"] not in seen_set]
-        for i in new:
-            seen_set.add(i["id"])
-            seen.append(i["id"])
+        new = []
+        for i in found:  # zelfde zoekertje op 2 sites = 1 melding
+            if i["id"] not in seen_set:
+                seen_set.add(i["id"])
+                seen.append(i["id"])
+                new.append(i)
 
         if not s.get("primed"):
             # eerste keer: bestaande zoekertjes alleen onthouden, niet melden
@@ -270,7 +298,8 @@ def check_searches(state):
         for i in new:
             if not matches(s, i) or sent >= MAX_ALERTS_PER_RUN:
                 continue
-            info = " · ".join(x for x in (price_text(i), html.escape(i["city"]), i["site"]) if x)
+            dist = f"{i['dist']:.0f} km" if i.get("dist") is not None else ""
+            info = " · ".join(x for x in (price_text(i), html.escape(i["city"]), dist, i["site"]) if x)
             send(
                 f"🎯 <b>{html.escape(i['title'])}</b>\n"
                 f"{info}\n"
@@ -292,7 +321,7 @@ HELP = (
     "iphone 15 tot 500 — met maximumprijs\n"
     "nike dunk tot 80 op vinted — maar één site\n"
     "ps5 op 2dehands en vinted — twee sites\n"
-    "fiets tot 200 binnen 15 km — rond je postcode (2dehands)\n\n"
+    "fiets tot 200 binnen 15 km — rond je postcode (2dehands + Marktplaats)\n\n"
     "lijst — je zoekopdrachten\n"
     "stop 2 — zoekopdracht 2 verwijderen\n\n"
     "Je krijgt alleen nieuwe zoekertjes; wat er al stond meld ik niet."
@@ -318,7 +347,7 @@ def parse_zoek(arg):
             max_price = float(m.group(1).replace(",", "."))
             arg = arg[:m.start()]
     if km and not explicit:
-        sites = ["2dehands"]  # afstand werkt op 2dehands (Belgische postcode)
+        sites = ["2dehands", "marktplaats"]  # sites waar afstand werkt
     return arg.strip(), max_price, sites, km, pc
 
 
