@@ -1,7 +1,26 @@
 {
- "searches": [],
- "seen": {},
- "update_offset": 811280773,
- "next_id": 5,
+ "searches": [
+  {
+   "id": 6,
+   "query": "iPhone 15 tot 225 -zoek",
+   "max_price": null,
+   "sites": [
+    "2dehands",
+    "marktplaats"
+   ],
+   "km": null,
+   "postcode": null,
+   "primed": true
+  }
+ ],
+ "seen": {
+  "6": [
+   "m2435770452",
+   "m2450627041",
+   "m2461291337"
+  ]
+ },
+ "update_offset": 811280780,
+ "next_id": 7,
  "last_error_notice": 1795004766.751246
 }
